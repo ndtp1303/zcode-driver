@@ -1,0 +1,11 @@
+node_modules/
+.zcode-driver/
+*.env
+.env
+run.jsonl
+run.err
+final.txt
+meta.json
+prompt.txt
+session.json
+.chrome-profile/
