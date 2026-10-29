@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -11,6 +11,8 @@ import { classifyPageText } from "../src/page-state.js";
 import { buildAuthInit, buildData, mintTerminalToken } from "../src/relay.js";
 import { parseRemoteUrl, relayWsUrl } from "../src/remote-url.js";
 import { matchProject, parseMode, profileDir } from "../src/session-options.js";
+import { plainChromeArgs } from "../src/plain-chrome.js";
+import { loginAndPair } from "../src/page-driver.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -114,6 +116,79 @@ test("profile path and permission mode defaults", () => {
   assert.equal(matchProject(["topup", "topup_netease"], "top").code, "ambiguous-project");
   assert.equal(matchProject(["wrongway", "muakey"], "WrongWay").name, "wrongway");
 });
+
+test("login spawns plain Chrome and checks the profile only after it closes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "zcode-login-"));
+  const lock = join(dir, "SingletonLock");
+  const url = "https://zcode.z.ai/remote/v4?sid=abc&mid=def";
+  let verifiedWhileLocked = false;
+  try {
+    await loginAndPair({
+      link: { pageUrl: url, deviceSid: "abc", deviceMid: "def" },
+      profile: dir,
+      chromePath: "/usr/bin/google-chrome",
+      sleep: () => Promise.resolve(),
+      spawnImpl: (_chrome, args) => {
+        assert.deepEqual(args, plainChromeArgs(dir, url));
+        assert.equal(args.some((arg) => /enable-automation|remote-debugging|disable-blink-features/.test(arg)), false);
+        symlinkSync("linux-box-1", lock);
+        return fakeChild(() => unlinkSync(lock));
+      },
+      verifyImpl: async () => {
+        verifiedWhileLocked = existsLock(lock);
+        return true;
+      },
+    });
+    assert.equal(verifiedWhileLocked, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("login-incomplete when the headless check does not see the task list", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "zcode-login-"));
+  const lock = join(dir, "SingletonLock");
+  try {
+    await assert.rejects(
+      () => loginAndPair({
+        link: { pageUrl: "https://zcode.z.ai/remote/v4?sid=abc", deviceSid: "abc" },
+        profile: dir,
+        chromePath: "/bin/true",
+        sleep: () => Promise.resolve(),
+        spawnImpl: () => {
+          symlinkSync("linux-box-2", lock);
+          return fakeChild(() => unlinkSync(lock));
+        },
+        verifyImpl: async () => false,
+      }),
+      (error) => error.code === "login-incomplete",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function fakeChild(onExit) {
+  const listeners = { exit: [], error: [] };
+  queueMicrotask(() => {
+    onExit();
+    for (const listener of listeners.exit) listener(0);
+  });
+  return {
+    once(event, listener) {
+      listeners[event].push(listener);
+    },
+  };
+}
+
+function existsLock(lock) {
+  try {
+    lstatSync(lock);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 test("run rejects an unknown mode before launching chrome", () => {
   const dir = mkdtempSync(join(tmpdir(), "zcode-mode-"));

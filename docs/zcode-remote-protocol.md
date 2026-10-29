@@ -197,7 +197,7 @@ The page hooks used for that:
 
 The link does not replace a login. Practical auth is a persistent Chrome profile, not a copied JWT:
 
-1. `run-zcode login` starts **headed** Chrome with `--user-data-dir` at `ZCODE_PROFILE` (default `~/.zcode-driver/profile`) on the remote URL.
+1. `run-zcode login` starts a **plain** Chrome process: `--user-data-dir=<profile> --no-first-run --no-default-browser-check <remote url>`. Playwright is not attached. Google rejects a Playwright-launched window with "Couldn't sign you in — This browser or app may not be secure". The default profile is `~/.zcode-driver/profile`. After the user closes that window, a headless Playwright check loads the same profile and prints `Task list is visible`, or exits `login-incomplete`.
 2. The person signs in with the same Z.ai account as the desktop. Google sign-in is the flow that was used live.
 3. The desktop app then asks the person to approve that browser. Until they accept, the phone page does not show the task list. On the wire this is `pair_status: "waiting"` until `matched`. The desktop copy for the other direction is "Waiting for phone"; the approval click itself is on the desktop app, not a button this driver presses.
 4. Later `run`, `continue`, `status`, `list`, `stop`, and `approvals` reuse that profile **headless**. `ZCODE_JWT` still selects the older ephemeral-browser path and skips the profile.

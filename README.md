@@ -23,7 +23,7 @@ zcode không có CLI headless cho phiên desktop. Máy tính mở một trang re
    scripts/run-zcode.sh login
    ```
 
-   Chrome hiện cửa sổ, profile mặc định `~/.zcode-driver/profile`. Đăng nhập **cùng tài khoản** với desktop (Z.ai qua Google được). Sau khi vào trang, app desktop hỏi chấp nhận trình duyệt này: phải bấm đồng ý trên desktop thì danh sách task mới hiện. Thấy task list thì đóng Chrome. Các lệnh sau mở lại đúng profile đó ở chế độ headless.
+   Lệnh này mở **Chrome thường**, không gắn Playwright (Google từ chối trình duyệt do automation mở: "Couldn't sign you in — This browser or app may not be secure"). Profile mặc định `~/.zcode-driver/profile`. Đăng nhập **cùng tài khoản** với desktop (Z.ai qua Google được). App desktop hỏi chấp nhận trình duyệt này: phải bấm đồng ý trên desktop thì danh sách task mới hiện. Thấy task list thì đóng Chrome. Driver đợi cửa sổ tắt, rồi mới kiểm tra profile bằng Chrome headless và in `Task list is visible`, hoặc thoát `login-incomplete`. Các lệnh sau dùng lại profile đó.
 
 5. `ZCODE_JWT` vẫn dùng được nếu không muốn profile. Khi JWT có giá trị, driver không đụng profile mà nhét token vào một Chrome tạm. Mẫu biến: `config/env.example`.
 6. Copy `skills/zcode-worker/SKILL.md` vào nơi Grok Bot đọc skill.

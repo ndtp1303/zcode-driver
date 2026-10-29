@@ -2,6 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { classifyPageText, failureReason } from "./page-state.js";
 import { redact, summarizeFrame } from "./output.js";
 import { matchProject, modeAlreadySelected } from "./session-options.js";
+import { plainChromeArgs, waitForPlainChrome } from "./plain-chrome.js";
 
 const SEND_NAME = /^(Send|发送)$/;
 const STOP_NAME = /^(Stop|停止生成)$/;
@@ -49,50 +50,54 @@ export async function withRemotePage({ link, credentials, secrets, log, timeoutM
   }
 }
 
-export async function loginAndPair({ link, profile }) {
+export async function loginAndPair({ link, profile, chromePath, spawnImpl, verifyImpl, sleep }) {
   mkdirSync(profile, { recursive: true });
-  const opened = await openChrome({ profile, headless: false, credentials: null });
-  const { page, context } = opened;
-  let sawReady = false;
-  let closed = false;
-  const untilClose = new Promise((resolve) => {
-    context.once("close", () => {
-      closed = true;
-      resolve();
-    });
-  });
+  const chrome = chromePath || findChrome();
+  if (!chrome) throw coded("chrome-missing", "Chrome/Chromium not found. Set ZCODE_CHROME.");
   process.stderr.write(
     [
-      `Chrome is open with profile ${profile}.`,
-      "Sign in with the same Z.ai account as the desktop (Google is fine).",
+      `Opening plain Chrome with profile ${profile}.`,
+      "This window is not automated, so Google sign-in can proceed.",
+      "Sign in with the same Z.ai account as the desktop.",
       "When the desktop app asks to approve this browser, accept it there.",
-      "Wait until this window shows the task list, then close Chrome.",
+      "After the task list appears, close Chrome. The profile is checked after that.",
       "",
     ].join("\n"),
   );
-  try {
-    await page.goto(link.pageUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    while (!closed) {
-      try {
-        if (await page.locator("[data-testid='task-new-button']").count()) {
-          if (!sawReady) {
-            sawReady = true;
-            process.stderr.write("Task list is visible. Close Chrome when you are done.\n");
-          }
-        }
-      } catch {
-        break;
-      }
-      await Promise.race([untilClose, page.waitForTimeout(1000).catch(() => {})]);
-    }
-  } finally {
-    if (!closed) await opened.close().catch(() => {});
-  }
-  if (!sawReady) {
+  await waitForPlainChrome({
+    chrome,
+    args: plainChromeArgs(profile, link.pageUrl),
+    profile,
+    spawnImpl,
+    sleep,
+  });
+  const ready = verifyImpl
+    ? await verifyImpl({ link, profile })
+    : await profileHasTaskList({ link, profile });
+  if (!ready) {
     throw coded(
       "login-incomplete",
       "Chrome closed before the task list appeared. Sign in, then approve the pairing request on the desktop app.",
     );
+  }
+  process.stderr.write("Task list is visible.\n");
+}
+
+async function profileHasTaskList({ link, profile }) {
+  const open = () => withRemotePage({
+    link,
+    credentials: null,
+    profile,
+    headless: true,
+    secrets: [link.deviceSid, link.deviceMid].filter(Boolean),
+    timeoutMs: 45_000,
+  }, async (page, state) => state.kind === "ready" && (await page.locator("[data-testid='task-new-button']").count()) > 0);
+  try {
+    return await open();
+  } catch (error) {
+    if (error.code !== "profile-busy") throw error;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    return open();
   }
 }
 
