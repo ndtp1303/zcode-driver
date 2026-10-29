@@ -1,0 +1,21 @@
+{
+  "name": "zcode-driver",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless driver that hands coding jobs to a ZCode desktop via its remote-control page.",
+  "type": "module",
+  "bin": {
+    "run-zcode": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node ./src/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "playwright-core": "1.56.1"
+  },
+  "license": "MIT"
+}
