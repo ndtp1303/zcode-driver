@@ -5,13 +5,15 @@ import { readCredentials } from "./credentials.js";
 import { RunLog } from "./output.js";
 import { listDevices, openRelay, readPairStatus, readWorkspaces, summarizeWorkspaces } from "./relay.js";
 import { describeLink, parseRemoteUrl } from "./remote-url.js";
+import { parseMode, profileDir } from "./session-options.js";
 
-const COMMANDS = new Set(["run", "status", "list", "continue", "stop", "approvals", "approve"]);
+const COMMANDS = new Set(["login", "run", "status", "list", "continue", "stop", "approvals", "approve"]);
 
 const HELP = `run-zcode — giao việc cho zcode desktop qua trang remote
 
 Cách dùng:
-  run-zcode <thư-mục> <file-prompt | "prompt">
+  run-zcode login
+  run-zcode [--project TÊN] [--mode ask] <thư-mục> <file-prompt | "prompt">
   run-zcode status
   run-zcode list
   run-zcode continue <thư-mục> <file-prompt | "prompt">
@@ -22,10 +24,12 @@ Cách dùng:
 Tuỳ chọn:
   --url URL          thay cho ZCODE_REMOTE_URL
   --timeout SECONDS  thời gian chờ trả lời (mặc định 180)
+  --project TÊN      project trong Select project (chỉ run)
+  --mode MODE        mặc định ask = Ask before changes
 
-Biến môi trường: ZCODE_REMOTE_URL, ZCODE_JWT, ZCODE_ACCESS_TOKEN,
-  ZCODE_PROVIDER, ZCODE_USER_INFO, ZCODE_CHROME
-Link và JWT là bí mật. Không ghi vào repo.
+Đăng nhập: login mở Chrome có cửa sổ, profile ~/.zcode-driver/profile
+  (ZCODE_PROFILE để đổi). Ký Z.ai, rồi bấm chấp nhận trên app desktop.
+  Các lệnh sau dùng lại profile đó, headless. ZCODE_JWT là cách khác, không bắt buộc.
 `;
 
 async function main(argv) {
@@ -48,10 +52,11 @@ async function main(argv) {
   const timeoutSec = Number(flags.timeout || process.env.ZCODE_TIMEOUT || 180);
   const timeoutMs = (Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec : 180) * 1000;
   try {
+    if (command === "login") return await cmdLogin(link);
     if (command === "status") return await cmdStatus(link, credentials, timeoutMs);
     if (command === "list") return await cmdList(link.ok ? link : null, credentials, timeoutMs);
     if (command === "run" || command === "continue") {
-      return await cmdRun(command, link, credentials, positionals, timeoutMs);
+      return await cmdRun(command, link, credentials, positionals, timeoutMs, flags);
     }
     if (command === "stop") return await cmdStop(link, credentials, positionals[0], timeoutMs);
     if (command === "approvals") return await cmdApprovals(link, credentials, positionals[0], timeoutMs);
@@ -63,8 +68,21 @@ async function main(argv) {
   return 2;
 }
 
+async function cmdLogin(link) {
+  const profile = profileDir();
+  const { loginAndPair } = await import("./page-driver.js");
+  try {
+    await loginAndPair({ link, profile });
+  } catch (error) {
+    process.stderr.write(`${error.code || "error"}: ${error.message}\n`);
+    return error.code === "login-incomplete" || error.code === "chrome-missing" ? 2 : 1;
+  }
+  process.stderr.write(`Saved Chrome profile: ${profile}\n`);
+  return 0;
+}
+
 async function cmdStatus(link, credentials, timeoutMs) {
-  if (!credentials.ok) return printAuth(credentials);
+  if (!credentials.ok) return browserStatus(link, timeoutMs);
   const devices = await listDevices(link.origin, credentials.jwt).catch((error) => {
     if (error.code !== "auth-required") throw error;
     return null;
@@ -99,7 +117,7 @@ async function cmdStatus(link, credentials, timeoutMs) {
 }
 
 async function cmdList(link, credentials, timeoutMs) {
-  if (!credentials.ok) return printAuth(credentials);
+  if (!credentials.ok) return browserList(link, timeoutMs);
   if (!link?.origin) {
     process.stderr.write("ZCODE_REMOTE_URL is not set\n");
     return 2;
@@ -137,7 +155,7 @@ async function cmdList(link, credentials, timeoutMs) {
   return 0;
 }
 
-async function cmdRun(command, link, credentials, positionals, timeoutMs) {
+async function cmdRun(command, link, credentials, positionals, timeoutMs, flags) {
   if (positionals.length < 2) {
     process.stderr.write(HELP);
     return 2;
@@ -147,14 +165,21 @@ async function cmdRun(command, link, credentials, positionals, timeoutMs) {
   const started = Date.now();
   const log = new RunLog(dir, { append: command === "continue" });
   log.prompt(prompt);
+  const modeChoice = command === "run" ? parseMode(flags.mode) : { ok: true, mode: null };
+  const useProfile = !credentials.ok;
+  const profile = useProfile ? profileDir() : null;
   const finish = (exit, reason, reply = "") => {
     log.final(reply);
     log.meta({
       exit,
       seconds: Math.round((Date.now() - started) / 1000),
-      mode: "playwright",
+      mode: useProfile ? "playwright-profile" : "playwright-jwt",
       command,
       reason,
+      auth: useProfile ? "profile" : "jwt",
+      profile,
+      project: flags.project || null,
+      permissionMode: modeChoice.ok ? modeChoice.mode?.id ?? null : null,
       ...describeLink(link),
       dir,
     });
@@ -162,15 +187,31 @@ async function cmdRun(command, link, credentials, positionals, timeoutMs) {
     if (reply) process.stdout.write(reply.endsWith("\n") ? reply : `${reply}\n`);
     return exit;
   };
+  if (command === "continue" && (flags.project || flags.mode)) {
+    const message = "continue keeps the open task. Use run --project and --mode to start a new task.";
+    log.err(message);
+    process.stderr.write(`${message}\n`);
+    return finish(2, "continue-options");
+  }
+  if (!modeChoice.ok) {
+    const message = `${modeChoice.code}: ${modeChoice.message}. Prompt was not sent.`;
+    log.err(message);
+    process.stderr.write(`${message}\n`);
+    return finish(2, modeChoice.code);
+  }
   if (!credentials.ok && credentials.code !== "auth-required" && credentials.code !== "jwt-expired") {
-    log.err(`${credentials.code}: ${credentials.message}. Prompt was not sent.`);
+    const message = `${credentials.code}: ${credentials.message}. Prompt was not sent.`;
+    log.err(message);
+    process.stderr.write(`${message}\n`);
     return finish(2, credentials.code);
   }
-  const { withRemotePage, sendPrompt } = await import("./page-driver.js");
+  const { withRemotePage, sendPrompt, prepareNewTask } = await import("./page-driver.js");
   try {
     const reply = await withRemotePage({
       link,
       credentials: credentials.ok ? credentials : null,
+      profile,
+      headless: true,
       secrets: [credentials.jwt, credentials.accessToken, link.deviceSid, link.deviceMid].filter(Boolean),
       log,
       timeoutMs,
@@ -180,9 +221,13 @@ async function cmdRun(command, link, credentials, positionals, timeoutMs) {
           ? (credentials.code === "jwt-expired" ? "jwt-expired" : "auth-required")
           : state.kind;
         const error = coded(reason, "Remote page is not ready for a prompt");
-        error.detail = (state.text || "").slice(0, 500);
+        const pairing = state.kind === "timeout" || state.kind === "unknown"
+          ? "\nIf the account is signed in, approve the pairing request on the desktop app."
+          : "";
+        error.detail = `${(state.text || "").slice(0, 500)}${pairing}`;
         throw error;
       }
+      if (command === "run") await prepareNewTask(page, { project: flags.project, mode: modeChoice.mode, log });
       log.event({ type: "driver", event: "prompt-sent", chars: prompt.length });
       const text = await sendPrompt(page, prompt, timeoutMs);
       log.event({ type: "driver", event: "reply", chars: text.length });
@@ -232,16 +277,63 @@ async function cmdApprove(link, credentials, positionals, timeoutMs) {
   });
 }
 
+async function browserStatus(link, timeoutMs) {
+  const profile = profileDir();
+  const { withRemotePage, readSession } = await import("./page-driver.js");
+  const session = await withRemotePage({
+    link,
+    credentials: null,
+    profile,
+    headless: true,
+    secrets: [link.deviceSid, link.deviceMid],
+    timeoutMs,
+  }, async (page, state) => ({ ...await readSession(page), surface: state.kind }));
+  process.stdout.write(`${JSON.stringify({ auth: "profile", profile, ...session }, null, 2)}\n`);
+  return session.page === "ready" || session.surface === "ready" ? 0 : 2;
+}
+
+async function browserList(link, timeoutMs) {
+  if (!link?.origin) {
+    process.stderr.write("ZCODE_REMOTE_URL is not set\n");
+    return 2;
+  }
+  const profile = profileDir();
+  const { withRemotePage, listVisibleWork, readSession } = await import("./page-driver.js");
+  const body = await withRemotePage({
+    link,
+    credentials: null,
+    profile,
+    headless: true,
+    secrets: [link.deviceSid, link.deviceMid],
+    timeoutMs,
+  }, async (page, state) => {
+    if (state.kind !== "ready") {
+      const error = coded(state.kind === "login" ? "auth-required" : state.kind, "Remote page is not signed in");
+      error.detail = (state.text || "").slice(0, 300);
+      throw error;
+    }
+    return { session: await readSession(page), ...(await listVisibleWork(page)) };
+  });
+  process.stdout.write(`${JSON.stringify({ auth: "profile", profile, ...body }, null, 2)}\n`);
+  return 0;
+}
+
 async function pageAction(link, credentials, dirArg, timeoutMs, command, action) {
-  if (!credentials.ok) return printAuth(credentials);
+  const useProfile = !credentials.ok;
+  if (!credentials.ok && credentials.code !== "auth-required" && credentials.code !== "jwt-expired") {
+    return printAuth(credentials);
+  }
+  const profile = useProfile ? profileDir() : null;
   const started = Date.now();
   const log = dirArg ? new RunLog(resolve(dirArg), { append: true }) : null;
   const { withRemotePage } = await import("./page-driver.js");
   try {
     await withRemotePage({
       link,
-      credentials,
-      secrets: [credentials.jwt, credentials.accessToken, link.deviceSid, link.deviceMid],
+      credentials: credentials.ok ? credentials : null,
+      profile,
+      headless: true,
+      secrets: [credentials.jwt, credentials.accessToken, link.deviceSid, link.deviceMid].filter(Boolean),
       log,
       timeoutMs,
     }, async (page, state) => {
@@ -302,7 +394,7 @@ function parseArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--help" || arg === "-h") flags.help = true;
-    else if (arg === "--url" || arg === "--timeout") {
+    else if (arg === "--url" || arg === "--timeout" || arg === "--project" || arg === "--mode") {
       flags[arg.slice(2)] = argv[index + 1];
       index += 1;
     } else positionals.push(arg);

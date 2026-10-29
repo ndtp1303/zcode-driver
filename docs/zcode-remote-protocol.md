@@ -177,11 +177,10 @@ method enum is only docker/WSL/SSH/MCP helpers.
 Re-implementing that codec and the service surface from the minified bundle
 would be a second client of a private protocol. This driver therefore:
 
-- speaks the JSON relay directly for `status` and `list` (pair status, device
-  list, workspace list once `matched`);
-- drives the official `/remote/v4` page with headless Chrome for `run`,
-  `continue`, `stop`, and approvals, and records the relay frames the page
-  already sends.
+- speaks the JSON relay directly for `status` and `list` when `ZCODE_JWT` is set;
+- otherwise reads `status` and `list` from the signed-in page, and drives that
+  page for `run`, `continue`, `stop`, and approvals, recording the relay frames
+  the page already sends.
 
 The page hooks used for that:
 
@@ -194,14 +193,41 @@ The page hooks used for that:
   / `允许`, `Deny` / `拒绝`. Titles include "Permission required" and
   "Awaiting approval".
 
+## Browser profile and the desktop approval
+
+The link does not replace a login. Practical auth is a persistent Chrome profile, not a copied JWT:
+
+1. `run-zcode login` starts **headed** Chrome with `--user-data-dir` at `ZCODE_PROFILE` (default `~/.zcode-driver/profile`) on the remote URL.
+2. The person signs in with the same Z.ai account as the desktop. Google sign-in is the flow that was used live.
+3. The desktop app then asks the person to approve that browser. Until they accept, the phone page does not show the task list. On the wire this is `pair_status: "waiting"` until `matched`. The desktop copy for the other direction is "Waiting for phone"; the approval click itself is on the desktop app, not a button this driver presses.
+4. Later `run`, `continue`, `status`, `list`, `stop`, and `approvals` reuse that profile **headless**. `ZCODE_JWT` still selects the older ephemeral-browser path and skips the profile.
+
+`run` clicks `[data-testid=task-new-button]` ("New task"), then the composer:
+
+| Control | Hook | Default |
+| --- | --- | --- |
+| Select project | `[data-testid=composer-workspace-trigger]`, menu `composer-project-menu`, rows `[data-project-name]` | none; pass `--project` |
+| Mode | `[data-testid=chat-mode-select-trigger]`, item `chat-mode-select-item-<id>` | `build` = "Ask before changes" |
+| Send | button name `Send` / `发送` | — |
+| Machine | button name `Switch device` / `切换设备` | the paired desktop |
+
+`continue` does not click New task and does not change project or mode. Mode ids from the 3.16.3 bundle: `build`, `default`, `edit`, `plan`, `yolo` (Full access), `guarded` (Autonomous).
+
+These clicks are taken from the bundle. They have not been executed against a signed-in page.
+
 ## Live check on 29 Oct 2026
 
 The supplied `/remote/v4` link (sid + mid, no hash, `app_version=3.16.3`)
 loaded the 3.16.3 SPA. With an empty browser profile the document title was
 "ZCode - Web Remote Control Sign In" and the only actions were "Connect to
 Z.ai" and "Connect to BigModel". No WebSocket was opened. The harmless prompt
-was not typed. Pairing, workspace list, and an agent reply remain untested
-until `ZCODE_JWT` from the same desktop account is available.
+was not typed.
+
+A normal Chrome session signed in as the desktop's Z.ai account (Google) and
+approved on the desktop does show the machine switcher, New task, the project
+task list, and a composer with Select project / Ask before changes. This
+driver was not run inside that session. New task, project selection, mode
+selection, pairing approval, and an agent reply are still untested here.
 
 ## Safety
 

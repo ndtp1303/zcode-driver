@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run one zcode remote job, or a status/list/continue/stop/approval command.
-# Usage: run-zcode.sh [--url URL] [--timeout SEC] <workdir> <prompt-file | "prompt">
+# Run one zcode remote job, or login/status/list/continue/stop/approval.
+# Usage: run-zcode.sh login
+#        run-zcode.sh [--project NAME] [--mode ask] [--url URL] [--timeout SEC] <workdir> <prompt>
 #        run-zcode.sh status|list|continue|stop|approvals|approve ...
 # Output of a run: <workdir>/run.jsonl, final.txt, run.err, meta.json
 set -euo pipefail

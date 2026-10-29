@@ -10,6 +10,7 @@ import { RunLog, redact, summarizeFrame } from "../src/output.js";
 import { classifyPageText } from "../src/page-state.js";
 import { buildAuthInit, buildData, mintTerminalToken } from "../src/relay.js";
 import { parseRemoteUrl, relayWsUrl } from "../src/remote-url.js";
+import { matchProject, parseMode, profileDir } from "../src/session-options.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -98,6 +99,31 @@ test("run log writes the omp-shaped files and redacts secrets", () => {
     assert.equal(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8")).exit, 2);
     assert.equal(redact("sid-value is here", ["sid-value"]), "[redacted] is here");
     assert.deepEqual(summarizeFrame('{"type":"auth_ack"}'), { message: { type: "auth_ack" }, truncated: false });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("profile path and permission mode defaults", () => {
+  assert.equal(profileDir({ HOME: "/home/me", ZCODE_PROFILE: "~/profiles/zcode" }).endsWith("/profiles/zcode"), true);
+  assert.equal(parseMode("").mode.id, "build");
+  assert.equal(parseMode("Ask before changes").mode.en, "Ask before changes");
+  assert.equal(parseMode("full").mode.id, "yolo");
+  assert.equal(parseMode("nope").ok, false);
+  assert.equal(matchProject(["topup", "topup_netease"], "topup").name, "topup");
+  assert.equal(matchProject(["topup", "topup_netease"], "top").code, "ambiguous-project");
+  assert.equal(matchProject(["wrongway", "muakey"], "WrongWay").name, "wrongway");
+});
+
+test("run rejects an unknown mode before launching chrome", () => {
+  const dir = mkdtempSync(join(tmpdir(), "zcode-mode-"));
+  try {
+    const result = spawnSync(process.execPath, [join(root, "src/cli.js"), "--mode", "nope", dir, "hello"], {
+      encoding: "utf8",
+      env: { ...process.env, ZCODE_REMOTE_URL: "https://zcode.z.ai/remote/v4?sid=abc&mid=def", ZCODE_JWT: "" },
+    });
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /Unknown mode/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

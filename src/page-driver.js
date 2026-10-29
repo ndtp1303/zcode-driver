@@ -1,6 +1,7 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { classifyPageText, failureReason } from "./page-state.js";
 import { redact, summarizeFrame } from "./output.js";
+import { matchProject, modeAlreadySelected } from "./session-options.js";
 
 const SEND_NAME = /^(Send|发送)$/;
 const STOP_NAME = /^(Stop|停止生成)$/;
@@ -21,31 +22,10 @@ export function findChrome(env = process.env) {
   return candidates.find((path) => existsSync(path)) ?? null;
 }
 
-export async function withRemotePage({ link, credentials, secrets, log, timeoutMs }, run) {
-  const chrome = findChrome();
-  if (!chrome) {
-    throw coded("chrome-missing", "Chrome/Chromium not found. Set ZCODE_CHROME.");
-  }
-  const { chromium } = await import("playwright-core");
-  const browser = await chromium.launch({
-    executablePath: chrome,
-    headless: true,
-    args: chromeArgs(),
-  });
+export async function withRemotePage({ link, credentials, secrets, log, timeoutMs, profile, headless = true }, run) {
+  const opened = await openChrome({ profile, headless, credentials });
   try {
-    const context = await browser.newContext({
-      locale: "en-US",
-      viewport: { width: 1400, height: 900 },
-    });
-    if (credentials?.ok) {
-      await context.addInitScript((keys) => {
-        localStorage.setItem("oauth:active_provider", keys.provider);
-        localStorage.setItem("zcodejwttoken", keys.jwt);
-        localStorage.setItem(keys.accessKey, keys.accessToken);
-        localStorage.setItem(keys.userKey, keys.userInfo);
-      }, credentials);
-    }
-    const page = await context.newPage();
+    const { page } = opened;
     page.on("websocket", (socket) => {
       const record = (direction, payload) => {
         const text = payloadToText(payload);
@@ -62,11 +42,211 @@ export async function withRemotePage({ link, credentials, secrets, log, timeoutM
     page.on("pageerror", (error) => log?.err(`pageerror: ${error.message}`));
     await page.goto(link.pageUrl, { waitUntil: "domcontentloaded", timeout: Math.min(timeoutMs, 45_000) });
     const state = await waitForSurface(page, Math.min(timeoutMs, 30_000));
-    log?.event({ type: "driver", event: "page", state: state.kind, detail: state.detail ?? null });
+    log?.event({ type: "driver", event: "page", state: state.kind, detail: state.detail ?? null, auth: profile ? "profile" : "jwt" });
     return await run(page, state);
   } finally {
-    await browser.close();
+    await opened.close();
   }
+}
+
+export async function loginAndPair({ link, profile }) {
+  mkdirSync(profile, { recursive: true });
+  const opened = await openChrome({ profile, headless: false, credentials: null });
+  const { page, context } = opened;
+  let sawReady = false;
+  let closed = false;
+  const untilClose = new Promise((resolve) => {
+    context.once("close", () => {
+      closed = true;
+      resolve();
+    });
+  });
+  process.stderr.write(
+    [
+      `Chrome is open with profile ${profile}.`,
+      "Sign in with the same Z.ai account as the desktop (Google is fine).",
+      "When the desktop app asks to approve this browser, accept it there.",
+      "Wait until this window shows the task list, then close Chrome.",
+      "",
+    ].join("\n"),
+  );
+  try {
+    await page.goto(link.pageUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    while (!closed) {
+      try {
+        if (await page.locator("[data-testid='task-new-button']").count()) {
+          if (!sawReady) {
+            sawReady = true;
+            process.stderr.write("Task list is visible. Close Chrome when you are done.\n");
+          }
+        }
+      } catch {
+        break;
+      }
+      await Promise.race([untilClose, page.waitForTimeout(1000).catch(() => {})]);
+    }
+  } finally {
+    if (!closed) await opened.close().catch(() => {});
+  }
+  if (!sawReady) {
+    throw coded(
+      "login-incomplete",
+      "Chrome closed before the task list appeared. Sign in, then approve the pairing request on the desktop app.",
+    );
+  }
+}
+
+export async function readSession(page) {
+  const text = await bodyText(page);
+  const ready = (await page.locator("[data-testid='task-new-button'], [data-lexical-editor='true']").count()) > 0;
+  const kind = ready ? "ready" : classifyPageText(text);
+  return {
+    page: kind,
+    deviceName: await deviceName(page),
+    project: await labeledText(page, "[data-testid='composer-workspace-trigger']"),
+    mode: await labeledText(page, "[data-testid='chat-mode-select-trigger']"),
+    detail: failureReason(text),
+  };
+}
+
+export async function listVisibleWork(page) {
+  const sidebar = await texts(page, "[data-testid='virtual-project-root-name']");
+  const tasks = await texts(page, "[data-testid^='task-item-']");
+  let projects = [];
+  const trigger = page.locator("[data-testid='composer-workspace-trigger']");
+  if (await trigger.count()) {
+    await trigger.first().click();
+    const menu = page.locator("[data-testid='composer-project-menu']");
+    await menu.waitFor({ state: "visible", timeout: 10_000 });
+    projects = await menu.locator("[data-project-name]").evaluateAll((nodes) => nodes.map((node) => ({
+      name: node.getAttribute("data-project-name"),
+      offline: node.getAttribute("aria-disabled") === "true" || node.hasAttribute("data-disabled"),
+      device: node.querySelector("[data-testid='composer-project-device']")?.textContent?.trim() || null,
+    })));
+    await page.keyboard.press("Escape");
+  }
+  return {
+    projects,
+    sidebarProjects: sidebar,
+    tasks: tasks.map((row) => row.split("\n")[0].trim()).filter(Boolean).slice(0, 40),
+  };
+}
+
+export async function prepareNewTask(page, { project, mode, log }) {
+  const created = page.locator("[data-testid='task-new-button']");
+  if (!(await created.count())) {
+    throw coded("new-task-missing", "New task button was not found. The page may still be waiting for desktop approval.");
+  }
+  await created.first().click();
+  log?.event({ type: "driver", event: "new-task" });
+  await page.locator("[data-lexical-editor='true']").last().waitFor({ state: "visible", timeout: 20_000 });
+  if (project) await selectProject(page, project, log);
+  await selectMode(page, mode, log);
+}
+
+async function selectProject(page, project, log) {
+  const trigger = page.locator("[data-testid='composer-workspace-trigger']");
+  await trigger.first().click();
+  const menu = page.locator("[data-testid='composer-project-menu']");
+  await menu.waitFor({ state: "visible", timeout: 10_000 });
+  const search = menu.locator("input");
+  if (await search.count()) await search.first().fill(project);
+  await page.waitForTimeout(300);
+  const names = await menu.locator("[data-project-name]").evaluateAll((nodes) => nodes
+    .filter((node) => node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("data-disabled"))
+    .map((node) => node.getAttribute("data-project-name")));
+  const matched = matchProject(names, project);
+  if (!matched.ok) {
+    await page.keyboard.press("Escape");
+    const error = coded(matched.code, matched.code === "ambiguous-project"
+      ? `Project "${project}" matches more than one: ${matched.names.join(", ")}`
+      : `Project "${project}" was not in Select project. Visible: ${matched.names.join(", ") || "(none)"}`);
+    error.names = matched.names;
+    throw error;
+  }
+  const item = menu.locator(`[data-project-name="${cssAttr(matched.name)}"]`);
+  if (!(await item.count())) throw coded("project-not-found", `Could not click project ${matched.name}`);
+  await item.first().click();
+  log?.event({ type: "driver", event: "project", name: matched.name });
+}
+
+async function selectMode(page, mode, log) {
+  const trigger = page.locator("[data-testid='chat-mode-select-trigger']");
+  if (!(await trigger.count())) {
+    throw coded("mode-missing", "Mode switch was not found, so the driver will not send in an unknown permission mode.");
+  }
+  const current = await trigger.first().innerText().catch(() => "");
+  if (modeAlreadySelected(current, mode)) {
+    log?.event({ type: "driver", event: "mode", id: mode.id, already: true });
+    return;
+  }
+  await trigger.first().click();
+  const item = page.locator(`[data-testid='chat-mode-select-item-${mode.id}']`);
+  await item.first().click({ timeout: 10_000 });
+  log?.event({ type: "driver", event: "mode", id: mode.id, label: mode.en });
+}
+
+async function openChrome({ profile, headless, credentials }) {
+  const chrome = findChrome();
+  if (!chrome) throw coded("chrome-missing", "Chrome/Chromium not found. Set ZCODE_CHROME.");
+  const { chromium } = await import("playwright-core");
+  const viewport = headless ? { width: 1400, height: 900 } : null;
+  if (profile) {
+    mkdirSync(profile, { recursive: true });
+    let context;
+    try {
+      context = await chromium.launchPersistentContext(profile, {
+        executablePath: chrome,
+        headless,
+        locale: "en-US",
+        viewport,
+        args: chromeArgs(headless),
+      });
+    } catch (error) {
+      const busy = /SingletonLock|process_singleton|profile.*in use|already running/i.test(error.message);
+      throw coded(busy ? "profile-busy" : "chrome-failed", error.message);
+    }
+    if (credentials?.ok) await injectLogin(context, credentials);
+    const page = context.pages()[0] ?? await context.newPage();
+    return { page, context, close: () => context.close() };
+  }
+  const browser = await chromium.launch({
+    executablePath: chrome,
+    headless,
+    args: chromeArgs(headless),
+  });
+  const context = await browser.newContext({ locale: "en-US", viewport: { width: 1400, height: 900 } });
+  if (credentials?.ok) await injectLogin(context, credentials);
+  const page = await context.newPage();
+  return { page, context, close: () => browser.close() };
+}
+
+async function injectLogin(context, credentials) {
+  await context.addInitScript((keys) => {
+    localStorage.setItem("oauth:active_provider", keys.provider);
+    localStorage.setItem("zcodejwttoken", keys.jwt);
+    localStorage.setItem(keys.accessKey, keys.accessToken);
+    localStorage.setItem(keys.userKey, keys.userInfo);
+  }, credentials);
+}
+
+async function deviceName(page) {
+  const button = page.getByRole("button", { name: /Switch device|切换设备/ });
+  if (!(await button.count())) return null;
+  const text = (await button.first().innerText()).split("\n").map((line) => line.trim()).filter(Boolean);
+  return text[0] ?? null;
+}
+
+async function labeledText(page, selector) {
+  const node = page.locator(selector);
+  if (!(await node.count())) return null;
+  return (await node.first().innerText()).replace(/\s+/g, " ").trim() || null;
+}
+
+async function texts(page, selector) {
+  return page.locator(selector).evaluateAll((nodes) => nodes
+    .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean));
 }
 
 export async function sendPrompt(page, prompt, timeoutMs) {
@@ -76,8 +256,12 @@ export async function sendPrompt(page, prompt, timeoutMs) {
   const before = await finalReply(page, "");
   await typeIntoComposer(page, prompt);
   const send = page.getByRole("button", { name: SEND_NAME });
-  if (await send.count()) await send.last().click();
-  else await page.keyboard.press("Enter");
+  if (await send.count()) {
+    if (await send.last().isDisabled()) {
+      throw coded("send-disabled", "Send is disabled. Choose a project with --project, and confirm the desktop approved pairing.");
+    }
+    await send.last().click();
+  } else await page.keyboard.press("Enter");
   return waitForReply(page, prompt, before, timeoutMs);
 }
 
@@ -117,7 +301,7 @@ async function waitForSurface(page, timeoutMs) {
     await page.waitForFunction(() => {
       const text = document.body?.innerText || "";
       if (/Sign In To Continue|登录后继续使用 Web 远程控制/.test(text)) return true;
-      if (document.querySelector("[data-lexical-editor='true']")) return true;
+      if (document.querySelector("[data-testid='task-new-button'], [data-lexical-editor='true']")) return true;
       return /Device disconnected|设备未连接|does not belong|Access Link Expired|Remote Control Ended|Taken Over By Another Device|Workspace Closed|Desktop Offline|Mobile Connection Invalid|Desktop Timed Out|Relay Unavailable|Web Remote Control Failed|该设备不属于|访问链接已失效|桌面端已离线|已被其他设备接管/.test(text);
     }, null, { timeout: timeoutMs });
   } catch {
@@ -125,7 +309,7 @@ async function waitForSurface(page, timeoutMs) {
     return { kind: "timeout", detail: failureReason(text), text };
   }
   const text = await bodyText(page);
-  if (await page.locator("[data-lexical-editor='true']").count()) {
+  if (await page.locator("[data-testid='task-new-button'], [data-lexical-editor='true']").count()) {
     return { kind: "ready", text };
   }
   const kind = classifyPageText(text);
@@ -195,10 +379,15 @@ function payloadToText(payload) {
   return String(payload);
 }
 
-function chromeArgs() {
+function chromeArgs(headless) {
   const args = ["--disable-dev-shm-usage"];
-  if (process.env.ZCODE_CHROME_NO_SANDBOX !== "0") args.push("--no-sandbox");
+  const sandbox = process.env.ZCODE_CHROME_NO_SANDBOX;
+  if (sandbox === "1" || (headless && sandbox !== "0")) args.push("--no-sandbox");
   return args;
+}
+
+function cssAttr(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 function coded(code, message) {
